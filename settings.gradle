@@ -1,0 +1,3 @@
+include ':remoter'
+include ':app'
+rootProject.name = "Remoter"
