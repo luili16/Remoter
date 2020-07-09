@@ -9,23 +9,28 @@ import android.os.IBinder
 import android.os.RemoteException
 import androidx.annotation.VisibleForTesting
 import java.nio.ByteBuffer
+import java.util.*
 
 // Implement remote process call.
 
+/**
+ * Remote process call.
+ */
 interface IRpc {
 
     /**
      * Represent a remote process call
      * @param to remote process id.
-     * @param requestBody request param we enforce the format of request body is json object.
-     * which means it starts with "{" or "[" and end with "}" or "]"
+     * @param requestBody content of request
      * @param response return value callback. success or error.
      *
      */
-    fun call(context: Context, to: Int, requestBody: ByteArray, response: Callback? = null)
+    fun call(context: Context, to: Int, requestBody: ByteArray, response: RemoteResponse? = null)
 }
 
-interface Callback {
+class RPCException(message:String,cause:Throwable?=null):Exception(message,cause)
+
+interface RemoteResponse {
     /**
      * response value from RPC
      *
@@ -41,7 +46,7 @@ interface Callback {
      * @param from remote process id
      * @param cause the reason of error response.
      */
-    fun onError(from: Int, cause: Throwable)
+    fun onError(from: Int, cause: RPCException)
 }
 
 /**
@@ -50,16 +55,16 @@ interface Callback {
  * +-----++-------++----++--++--++-------++-----++-------------++-------+--------------------------+
  * |magic||version||from||to||id||segment||index||segmentLength|| length|            body          |
  * +-----++-------++----++--++--++-------++-----++-------------++-------+--------------------------+
- *    1       1       4    4   4     1       1          4             4  |
+ *    1       1       4    4  16     1       1          4             4  |
  * -------------------  header  -----------------------------------------
  *
  *  magic: constant value        1 byte
  *  version: protocol version    1 byte
  *  from: who send this msg      4 byte
  *  to: who receive this msg     4 byte
- *  id: identity this msg        4 byte
- *  segment: how many segments this msg have. This means a long msg is split.   1 byte
- *  index: index of segments     1byte
+ *  id: identity this msg        16 byte 128bit UUID
+ *  segment: how many segments this msg have. This means a long msg will be split.   1 byte
+ *  index: index of segments 0 - 255 means max size is 128MB     1byte
  *  segmentLength: length of segment 4byte
  *  length: length of body       4byte
  *  body: content of body,max size is 512 * 1024byte. msg greater than 512 * will be split
@@ -69,7 +74,7 @@ class RpcProtocol:Comparable<RpcProtocol> {
     private var version: Byte? = null
     private var from: Int? = null
     private var to: Int? = null
-    private var id: Int? = null
+    private var id: UUID? = null
     private var segment: Byte? = null
     private var index: Byte? = null
     private var segmentLength:Int? = null
@@ -79,13 +84,12 @@ class RpcProtocol:Comparable<RpcProtocol> {
     private var buffer:ByteBuffer? = null
     companion object {
 
-        private const val BYTE_LENGTH = 8
-        private const val MAX = 512 * 1024
+        const val MAX = 128 * 1024
         private const val MAGIC_LENGTH = 1
         private const val VERSION_LENGTH = 1
         private const val FROM_LENGTH = 4
         private const val TO_LENGTH = 4
-        private const val ID_LENGTH = 4
+        const val ID_LENGTH = 16
         private const val SEGMENT_LENGTH = 1
         private const val INDEX_LENGTH = 1
         private const val SEGMENT_LENGTH_LENGTH = 4
@@ -122,7 +126,7 @@ class RpcProtocol:Comparable<RpcProtocol> {
             version: Byte,
             from: Int,
             to: Int,
-            id: Int,
+            id: UUID,
             length: Int,
             body: ByteArray
         ) : List<RpcProtocol> {
@@ -152,22 +156,28 @@ class RpcProtocol:Comparable<RpcProtocol> {
             } else {
                 val segment = length / MAX
                 if (segment > Byte.MAX_VALUE) {
-                    throw IllegalArgumentException("body to long. size:$length")
+                    throw IllegalArgumentException("body to long. size:$length body length should less than 128MB")
                 }
 
                 val last = length - segment * MAX
+                val s = if (last == 0) {
+                    segment
+                } else {
+                    segment + 1
+                }
+
                 val protocols:MutableList<RpcProtocol> = mutableListOf()
-                for (index in 0 .. segment) {
-                    val segmentLength = if (index == segment) {
-                        last
+                for (index in 0 until s) {
+                    val segmentLength = if (index == s - 1) {
+                        if (last == 0) {
+                            MAX
+                        } else {
+                            last
+                        }
                     } else {
                         MAX
                     }
-                    val s = if (last == 0) {
-                        segment
-                    } else {
-                        segment + 1
-                    }
+
                     val protocol = RpcProtocol(
                         magic = magic,
                         version = version,
@@ -200,7 +210,7 @@ class RpcProtocol:Comparable<RpcProtocol> {
         version:Byte,
         from:Int,
         to:Int,
-        id:Int,
+        id:UUID,
         segment:Byte,
         index:Byte,
         segmentLength:Int,
@@ -224,7 +234,8 @@ class RpcProtocol:Comparable<RpcProtocol> {
         this.buffer = ByteBuffer.wrap(bytes)
         val segmentLength = locateSegmentLength()
         if (segmentLength + HEADER_LENGTH != bytes.size) {
-            throw IllegalArgumentException("Illegal RpcProtocol bytes. expected length: ${segmentLength + HEADER_LENGTH} actual:${bytes.size}")
+            throw IllegalArgumentException("Illegal RpcProtocol bytes. expected " +
+                    "length: ${segmentLength + HEADER_LENGTH} actual:${bytes.size}")
         }
     }
 
@@ -264,11 +275,18 @@ class RpcProtocol:Comparable<RpcProtocol> {
         }
     }
 
-    fun locateId(): Int {
+    fun locateId(): UUID {
         return if (this.id != null) {
             this.id!!
         } else {
-            buffer!!.getInt(idPosition)
+            val uuid = ByteArray(ID_LENGTH)
+            buffer!!.position(idPosition)
+            buffer!!.get(uuid)
+            val buf = ByteBuffer.wrap(uuid)
+            buf.position(0)
+            val msb = buf.long
+            val lsb = buf.long
+            return UUID(msb,lsb)
         }
     }
 
@@ -356,7 +374,8 @@ class RpcProtocol:Comparable<RpcProtocol> {
             buffer.put(version!!)
             buffer.putInt(from!!)
             buffer.putInt(to!!)
-            buffer.putInt(id!!)
+            buffer.putLong(id!!.mostSignificantBits)
+            buffer.putLong(id!!.leastSignificantBits)
             buffer.put(segment!!)
             buffer.put(index!!)
             buffer.putInt(segmentLength!!)
@@ -387,130 +406,148 @@ class RpcProtocol:Comparable<RpcProtocol> {
 class BinderRpc(private val from:Int) : IRpc {
 
     companion object {
-        const val TEST_SERVICE_ID = 1
+        const val TEST_SERVICE_ID_1 = 1
+        const val TEST_SERVICE_ID_2 = 2
+        const val TEST_SERVICE_ID_3 = 3
     }
     private var route: IRoute? = null
 
     /**
-     * represent a unique remote call.
-     *
-     * TODO how to generate a unique id????
-     */
-    private var initId: Int = 0
-
-    /**
      * Use this map to cache a remote call. when remote service is connecting.
      */
-    private val pendingCall: MutableMap<Int,CallHolder> = mutableMapOf()
+    private val pendingCall: MutableMap<String,CallHolder> = mutableMapOf()
 
     /**
      * cache all the response callback for later use.
      */
-    private val responseCache:MutableMap<Int,ResponseHolder> = mutableMapOf()
+    private val responseCache:MutableMap<String,ResponseHolder> = mutableMapOf()
     private var binderService: IBinder? = null
     private var serviceDisconnectedCalled: Boolean = false
     private val services:Map<Int,Class<*>>
     init {
 
         services = mapOf(
-            Pair(TEST_SERVICE_ID,TestService::class.java)
+            Pair(TEST_SERVICE_ID_1,TestService::class.java),
+            Pair(TEST_SERVICE_ID_2,TestService2::class.java),
+            Pair(TEST_SERVICE_ID_3,TestService3::class.java)
         )
     }
     private val receiver : IReceiver = object: IReceiver.Stub() {
         override fun onReceive(data: ByteArray) {
             val protocol = RpcProtocol.asRpcProtocol(data)
-            val id = protocol.locateId()
+            val id = protocol.locateId().toString()
             val from = protocol.locateFrom()
             val to = protocol.locateTo()
             val segment = protocol.locateSegment()
             val holder = synchronized(responseCache) { responseCache[id] }
-            if (holder != null) {
-                if (to != this@BinderRpc.from) {
-                    holder.callResponse?.onError(from,IllegalStateException("expected to:${this@BinderRpc.from} but received:$to"))
-                    return
-                }
+                ?: throw IllegalStateException("unknown id: $id protocol( " +
+                        "from:$from " +
+                        "to:$to " +
+                        "segment:$segment index:${protocol.locateIndex()} " +
+                        "segmentLength:${protocol.locateSegmentLength()} " +
+                        "length:${protocol.locateLength()} " +
+                        "body size:${protocol.locateBody().length} )")
+            if (to != this@BinderRpc.from) {
+                holder.callResponse?.onError(from, RPCException(message = "expected to:${this@BinderRpc.from} but received:$to"))
+                return
+            }
 
-                if (segment == 1.toByte()) {
-                    val body = protocol.locateBody()
-                    holder.callResponse?.onResponse(from,body.data,body.offset,body.length)
-                    synchronized(responseCache) { responseCache.remove(id) }
-                } else {
-                    val responses = holder.remoteResponse
-                    responses.add(protocol)
-                    if (responses.size == segment.toInt()) {
-                        // we received all
-                        responses.sort()
-                        // copy value
-                        // TODO how to avoid copy?
-                        val dst = ByteArray(protocol.locateLength())
-                        var offset = 0
-                        for (r in responses) {
-                            val w = r.locateBody()
-                            System.arraycopy(w.data,w.offset,dst,offset,w.length)
-                            offset += w.length
-                        }
-                        holder.callResponse?.onResponse(from,dst,0,dst.size)
-                        synchronized(responseCache) { responseCache.remove(id) }
-                    }
-                }
+            if (segment == 1.toByte()) {
+                val body = protocol.locateBody()
+                holder.callResponse?.onResponse(from,body.data,body.offset,body.length)
+                synchronized(responseCache) { responseCache.remove(id) }
             } else {
-                Logger.e(msg = "unknown call id:${id}")
+                val responses = holder.remoteResponse
+                responses.add(protocol)
+                if (responses.size == segment.toInt()) {
+                    // we received all
+                    responses.sort()
+                    // copy value
+                    // TODO how to avoid copy?
+                    val dst = ByteArray(protocol.locateLength())
+                    var offset = 0
+                    for (r in responses) {
+                        val w = r.locateBody()
+                        System.arraycopy(w.data,w.offset,dst,offset,w.length)
+                        offset += w.length
+                    }
+                    holder.callResponse?.onResponse(from,dst,0,dst.size)
+                    synchronized(responseCache) { responseCache.remove(id) }
+                }
             }
         }
     }
 
-    override fun call(context: Context,to: Int, requestBody: ByteArray, response: Callback?) {
-        val holder = createHolder(from,to,requestBody)
-        synchronized(responseCache) {
-            responseCache[holder.id] = ResponseHolder(response)
-        }
+    override fun call(context: Context,to: Int, requestBody: ByteArray, response: RemoteResponse?) {
 
-        if ((binderService != null && !binderService!!.isBinderAlive) || !serviceDisconnectedCalled) {
+        try {
 
-            val cls: Class<*>? = services[to]
-            if (cls == null) {
-                response?.onError(from,ClassNotFoundException())
+            val holder = createHolder(from,to,requestBody)
+            synchronized(responseCache) {
+                responseCache[holder.id.toString()] = ResponseHolder(response)
+            }
+
+            if ((binderService != null && !binderService!!.isBinderAlive) || !serviceDisconnectedCalled) {
+
+                val cls: Class<*>? = services[to]
+                if (cls == null) {
+                    response?.onError(from, RPCException(message = "query remote service fail. to:$to"))
+                    return
+                }
+
+                // Just cache this call
+                // bind service and wait service connected.
+                synchronized(pendingCall) {
+                    pendingCall[holder.id.toString()] = holder
+                }
+
+                context.bindService(Intent(context,cls), object: ServiceConnection {
+
+                    override fun onServiceDisconnected(name: ComponentName) {
+                        serviceDisconnectedCalled = false
+                        route = null
+                    }
+
+                    override fun onServiceConnected(name: ComponentName, service: IBinder) {
+                        route = IRoute.Stub.asInterface(service)
+                        try {
+                            route!!.setReceiver(from,receiver)
+                            binderService = service
+                            serviceDisconnectedCalled = true
+
+                            synchronized(pendingCall) {
+                                drainPendingCall()
+                            }
+                        } catch (e:Exception) {
+                            response?.onError(from, RPCException(message = "exec rpc method fail",cause = e))
+                            clear()
+                        }
+                    }
+
+                },Context.BIND_AUTO_CREATE)
+
                 return
             }
 
-            // Just cache this call
-            // bind service and wait service connected.
             synchronized(pendingCall) {
-                pendingCall[holder.id] = holder
+                if (pendingCall.isNotEmpty()) {
+                    drainPendingCall()
+                }
             }
 
-            context.bindService(Intent(context,cls), object: ServiceConnection {
-
-                override fun onServiceDisconnected(name: ComponentName) {
-                    serviceDisconnectedCalled = false
-                    route = null
-                }
-
-                override fun onServiceConnected(name: ComponentName, service: IBinder) {
-                    route = IRoute.Stub.asInterface(service)
-                    route!!.setReceiver(from,receiver)
-                    binderService = service
-                    serviceDisconnectedCalled = true
-
-                    synchronized(pendingCall) {
-                        drainPendingCall()
-                    }
-                }
-
-            },Context.BIND_AUTO_CREATE)
-
-            return
-        }
-
-        synchronized(pendingCall) {
-            if (pendingCall.isNotEmpty()) {
-                drainPendingCall()
+            for (p in holder.protocols) {
+                route!!.send(p.asArray())
             }
+        } catch (e:Exception) {
+            response?.onError(from, RPCException(message = "call rpc method fail",cause = e))
+            clear()
         }
+    }
 
-        for (p in holder.protocols) {
-            route!!.send(p.asArray())
-        }
+    private fun clear() {
+        route = null
+        binderService = null
+        serviceDisconnectedCalled = false
     }
 
     private fun drainPendingCall() {
@@ -527,9 +564,7 @@ class BinderRpc(private val from:Int) : IRpc {
     }
 
     private fun createHolder(from: Int, to: Int, requestBody: ByteArray): CallHolder {
-        initId++
-        val id = initId
-        Logger.d(msg = "to:$to id:$id")
+        val id = UUID.randomUUID()
         val protocols = RpcProtocol.create(
             magic = RpcProtocol.MAGIC,
             version = RpcProtocol.VERSION_1,
@@ -546,20 +581,20 @@ class BinderRpc(private val from:Int) : IRpc {
     }
 
     private data class CallHolder(
-        val id:Int,
+        val id:UUID,
         val protocols:List<RpcProtocol>
     )
 
     private data class ResponseHolder(
-        val callResponse:Callback?,
+        val callResponse:RemoteResponse?,
         val remoteResponse:MutableList<RpcProtocol> = mutableListOf()
     )
 }
 
-private class RouteImpl(private val processor: IRemoteRequestProcessor): IRoute.Stub() {
+internal class RouteImpl(private val processor: IRemoteRequestProcessor): IRoute.Stub() {
 
     private val responseReceivers : MutableMap<Int,IReceiver> = mutableMapOf()
-    private val requestsCache:MutableMap<Int,MutableMap<Int,RequestHolder>> = mutableMapOf()
+    private val requestsCache:MutableMap<Int,MutableMap<String,RequestHolder>> = mutableMapOf()
 
     override fun send(data: ByteArray) {
         val protocol = RpcProtocol.asRpcProtocol(data)
@@ -569,7 +604,7 @@ private class RouteImpl(private val processor: IRemoteRequestProcessor): IRoute.
         val receiver = synchronized(responseReceivers) { responseReceivers[from] }
         if (segment == 1.toByte()) {
             // receive full data
-            processor.process(protocol.locateBody(), RemoteCommand(protocol,receiver))
+            processor.process(protocol.locateBody(), InvokeCommand(protocol,receiver))
         } else {
             val holder : RequestHolder = synchronized(requestsCache) {
                 var request = requestsCache[from]
@@ -577,10 +612,10 @@ private class RouteImpl(private val processor: IRemoteRequestProcessor): IRoute.
                     request = mutableMapOf()
                     requestsCache[from] = request
                 }
-                var h = request[id]
+                var h = request[id.toString()]
                 if (h == null) {
                     h = RequestHolder()
-                    request[id] = h
+                    request[id.toString()] = h
                 }
                 h.protocols.add(protocol)
                 h
@@ -599,7 +634,7 @@ private class RouteImpl(private val processor: IRemoteRequestProcessor): IRoute.
                     offset += w.length
                 }
                 processor.process(RpcProtocol.BodyWrapper(dst, 0, dst.size),
-                    RemoteCommand(protocol,receiver)
+                    InvokeCommand(protocol,receiver)
                 )
                 synchronized(requestsCache) { requestsCache.remove(from) }
             }
@@ -626,10 +661,24 @@ class TestService: Service() {
     }
 }
 
+class TestService2:Service() {
+    private val route: IRoute.Stub = RouteImpl(TestProcessor())
+    override fun onBind(intent: Intent?): IBinder? {
+        return route
+    }
+}
+
+class TestService3:Service() {
+    private val route: IRoute.Stub = RouteImpl(TestProcessor())
+    override fun onBind(intent: Intent?): IBinder? {
+        return route
+    }
+}
+
 /**
  * Used for send response data to remote request.
  */
-class RemoteCommand(
+class InvokeCommand(
     private val request:RpcProtocol,
     private val receiver:IReceiver?= null) {
 
@@ -657,22 +706,21 @@ class RemoteCommand(
                 receiver?.onReceive(p.asArray())
             } catch (e: RemoteException) {
                 Logger.e(msg = "request client died.",cause = e)
-                throw e
             }
         }
     }
 }
 
 /**
- * process remote request and send result by [RemoteCommand]
+ * process remote request and send result by [InvokeCommand]
  */
 interface IRemoteRequestProcessor {
-    fun process(body:RpcProtocol.BodyWrapper, command:RemoteCommand)
+    fun process(body:RpcProtocol.BodyWrapper, command:InvokeCommand)
 }
 
 // just for test.
 private class TestProcessor: IRemoteRequestProcessor {
-    override fun process(body: RpcProtocol.BodyWrapper, command:RemoteCommand) {
+    override fun process(body: RpcProtocol.BodyWrapper, command:InvokeCommand) {
         val dest = ByteArray(body.length)
         System.arraycopy(body.data,body.offset,dest,0,body.length)
         command.send(dest)

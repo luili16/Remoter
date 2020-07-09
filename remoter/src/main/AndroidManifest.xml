@@ -2,6 +2,15 @@
     package="com.llx278.remoter">
 
     <application>
-        <service android:name=".TestService" android:exported="false"/>
+        <service android:name=".TestService"
+            android:exported="false"/>
+
+        <service android:name=".TestService2"
+            android:process=":test2"
+            android:exported="false"/>
+
+        <service android:name=".TestService3"
+            android:process=":test3"
+            android:exported="false"/>
     </application>
 </manifest>
