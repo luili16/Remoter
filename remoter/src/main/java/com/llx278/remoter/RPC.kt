@@ -653,25 +653,34 @@ internal class RouteImpl(private val processor: IRemoteRequestProcessor): IRoute
     )
 }
 
+abstract class RemoteProxyService:Service() {
+    private var route: IRoute.Stub? = null
+    override fun onBind(intent: Intent?): IBinder? {
+        if (route == null) {
+            route = RouteImpl(createProcessor())
+        }
+        return route
+    }
+
+    abstract fun createProcessor(): IRemoteRequestProcessor
+}
+
 // used for test
-class TestService: Service() {
-    private val route: IRoute.Stub = RouteImpl(TestProcessor())
-    override fun onBind(intent: Intent?): IBinder? {
-        return route
+class TestService: RemoteProxyService() {
+    override fun createProcessor(): IRemoteRequestProcessor {
+        return TestProcessor()
     }
 }
 
-class TestService2:Service() {
-    private val route: IRoute.Stub = RouteImpl(TestProcessor())
-    override fun onBind(intent: Intent?): IBinder? {
-        return route
+class TestService2: RemoteProxyService() {
+    override fun createProcessor(): IRemoteRequestProcessor {
+        return TestProcessor()
     }
 }
 
-class TestService3:Service() {
-    private val route: IRoute.Stub = RouteImpl(TestProcessor())
-    override fun onBind(intent: Intent?): IBinder? {
-        return route
+class TestService3:RemoteProxyService() {
+    override fun createProcessor(): IRemoteRequestProcessor {
+        return TestProcessor()
     }
 }
 
